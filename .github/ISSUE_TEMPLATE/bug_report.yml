@@ -1,0 +1,45 @@
+name: Bug Report
+description: Report a problem with the RG477M-StockFix Magisk module
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: module_version
+    attributes:
+      label: RG477M-StockFix Version
+      placeholder: "e.g. v0.1.3"
+    validations:
+      required: true
+  - type: input
+    id: firmware_build
+    attributes:
+      label: Stock Firmware Version
+      value: "V1.32"
+    validations:
+      required: true
+  - type: dropdown
+    id: profile_modes
+    attributes:
+      label: Quick Panel CPU & Fan Mode
+      options:
+        - CPU Balance / Fan Balance
+        - CPU Game / Fan Balance
+        - CPU Game / Fan Turbo
+        - CPU Turbo / Fan Turbo
+        - Fan Silent or Fixed
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Steps & Description
+      description: What happened (fan in sleep, audio pop, performance drop, boot issue)?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ADB / Shell Output (Optional)
+      description: Paste output of `adb shell su -c "ps -ef | grep rg477m"` or thermal/fan sysfs readings if available.
+      render: text

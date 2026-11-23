@@ -1,0 +1,15 @@
+# Build artifacts & logs (never commit)
+build/
+logs/
+*.zip
+*.sha256
+*.log
+
+# Local env / IDE / OS
+local.paths.json
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini
