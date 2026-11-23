@@ -1,5 +1,20 @@
 # Changelog (`RG477M-StockFix`)
 
+## v0.1.4
+- **Tier 1 & Tier 2 Power Optimization + Config (`/data/adb/rg477m_stockfix.conf`):**
+  - Added user-configurable toggle file `/data/adb/rg477m_stockfix.conf` (auto-created on first boot with all options enabled by default, plus `FREEZE_WHITELIST` for custom package/UID exclusions).
+  - **Tier 1 (Sched / Memory / UFS / Loggers):**
+    - Clamped background cgroups (`background` `uclamp.max=30`, `system-background` `uclamp.max=50`) so background tasks cannot spike performance cores.
+    - Enforced `700 MHz` mid/big cluster CPU ceiling and `powersave` UFS governor (`112b0000.ufshci`) in `screen_off` and `saver` (`mode_0`), cleanly restoring full clocks (`3200/3350 MHz`, `simple_ondemand`) on wake/active profiles without fighting stock `thermal_core`.
+    - Added CPU ceiling backoff (`2600/2800 MHz` on `policy4`/`policy7`) inside `thermal_guard >= 85 °C` for faster cooldown alongside the `900 MHz` GPU cap.
+    - Tuned GKI 6.1 memory & UFS (`lru_gen/min_ttl_ms=1000`, `vm.swappiness=60` for 12 GB RAM, `read_ahead_kb=256`, `iostats=0`).
+    - Set `persist.traced.enable=0` in `system.prop` and stopped safe non-HAL loggers (`mobile_log_d`, `emdlogger`, `traced`, `traced_probes`), leaving `connsyslogger` and `lbs_dbg_ext` running.
+    - Disabled unnecessary stock power-wake settings (`mobile_data_always_on=0`, `doze_pulse_on_pick_up=0`, `wake_gesture_enabled=0`).
+  - **Tier 2 (Deep Sleep / Doze / Optional Non-Cellular Toggles):**
+    - Enabled and accelerated Android Doze (`dumpsys deviceidle enable all` + faster `device_idle_constants` transition to idle).
+    - Added GammaOS-style `cgroup.freeze` sleep freezer for user/background UIDs (`uid >= 10000`) 15s after screen-off (auto-excluding active VPN `tun*` owners such as AdGuard/VPNs, user Doze whitelist entries, active speaker playback, SystemUI, Anbernic controls/launcher/IME, Magisk, and `FREEZE_WHITELIST`), with immediate unfreeze on screen-on and cleanup.
+    - Kept `STOP_GPS_DAEMONS=0` and `STOP_RIL_DAEMON=0` disabled by default in `/data/adb/rg477m_stockfix.conf` (stopping Stock V1.32 GNSS/LBS AIDL HALs causes `system_server` Watchdog bootloops).
+
 ## v0.1.3
 - Separated module into standalone repository `RG477M-StockFix` with native Magisk `updateJson` auto-update support.
 - Preserved module ID `rg477m_perf_tuning` for seamless updates over earlier Toolkit installations.

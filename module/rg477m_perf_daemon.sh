@@ -1,13 +1,17 @@
 #!/system/bin/sh
-# RG477M MT6897 Adaptive Performance, Frame Pacing & Smooth Fan Daemon (V1.32 verified)
+# RG477M MT6897 Adaptive Performance, Power Saving & Smooth Fan Daemon (V1.32 verified)
 # - Keeps thermal_core active, enforces LVTS-safe thermal backoff at >=85C.
 # - Fixes CPU mid-cluster dips via real schedutil/rate_limit_us + uclamp.
-# - Replaces jumpy stock Auto fan curve (fan_mode=1) with EMA-smoothed ramp (0..255).
+# - Clamps background uclamp.max, tunes MGLRU/VM/UFS, and caps CPU/UFS clocks in sleep/saver.
+# - Replaces jumpy stock Auto fan curves with EMA-smoothed ramps and instant 0 PWM in sleep.
 # - Eliminates analog speaker pop/click (GPIO 5) via is_fm_enable without AudioFlinger timers.
+# - Supports Doze tuning, logger/GPS/RIL stopping, and cgroup.freeze sleep via /data/adb/rg477m_stockfix.conf.
 
+CONF_FILE="/data/adb/rg477m_stockfix.conf"
 GPU_DEV="/sys/devices/platform/soc/13000000.mali/devfreq/13000000.mali"
 GED_HAL="/sys/kernel/ged/hal"
 FIX_OPP="/proc/gpufreqv2/fix_target_opp_index"
+UFS_GOV="/sys/class/devfreq/112b0000.ufshci/governor"
 UCLAMP_TOP="/dev/cpuctl/top-app/cpu.uclamp.min"
 UCLAMP_LAT="/dev/cpuctl/top-app/cpu.uclamp.latency_sensitive"
 CPUIDLE_GOV="/sys/devices/system/cpu/cpuidle/current_governor"
@@ -17,8 +21,223 @@ AMP_NODE="/sys/devices/platform/11050000.mt6897-afe-pcm/is_fm_enable"
 AFE_PM_NODE="/sys/devices/platform/11050000.mt6897-afe-pcm/power/runtime_status"
 JACK_NODE="/sys/bus/platform/drivers/pmic-codec-accdet/state"
 
+ENABLE_VM_UFS_TUNE=1
+ENABLE_POWER_SETTINGS=1
+ENABLE_DOZE_TUNE=1
+ENABLE_SLEEP_FREEZE=1
+SLEEP_FREEZE_DELAY_SEC=15
+STOP_MTK_LOGGERS=1
+STOP_GPS_DAEMONS=0
+STOP_RIL_DAEMON=0
+FREEZE_WHITELIST=""
+
+EXEMPT_UIDS=""
+frozen_uids=""
+apps_frozen=0
+sleep_sec=0
+
 w() {
     [ -e "$1" ] && echo "$2" > "$1" 2>/dev/null || true
+}
+
+load_config() {
+    if [ ! -f "$CONF_FILE" ]; then
+        cat <<'EOF' > "$CONF_FILE" 2>/dev/null || true
+# RG477M-StockFix configuration (1 = enabled, 0 = disabled)
+# Changes take effect after module reload / device reboot.
+
+# Tier 1: Cap background uclamp.max (30/50), MGLRU min_ttl_ms=1000, swappiness=60, UFS ra=256 / iostats=0
+ENABLE_VM_UFS_TUNE=1
+
+# Tier 1: Power-saving Android settings (mobile_data_always_on=0, disable wake gestures)
+ENABLE_POWER_SETTINGS=1
+
+# Tier 2: Enable & accelerate Android Doze mode (inactive_to=180s) for standby battery savings
+ENABLE_DOZE_TUNE=1
+
+# Tier 2: Freeze non-exempt user/background UIDs via cgroup.freeze after screen off
+ENABLE_SLEEP_FREEZE=1
+SLEEP_FREEZE_DELAY_SEC=15
+
+# Tier 1: Stop MediaTek debug loggers and Perfetto trace daemons
+STOP_MTK_LOGGERS=1
+
+# Tier 2 (disabled by default): Stopping GNSS/LBS AIDL HALs causes system_server watchdog on Stock V1.32
+STOP_GPS_DAEMONS=0
+
+# Tier 2 (disabled by default): Keep disabled on Stock V1.32 unless tested safe on your build
+STOP_RIL_DAEMON=0
+
+# Space-separated package names or numeric UIDs excluded from cgroup.freeze (e.g. VPN/music player)
+FREEZE_WHITELIST=""
+EOF
+        chmod 644 "$CONF_FILE" 2>/dev/null || true
+    fi
+
+    if [ -r "$CONF_FILE" ]; then
+        . "$CONF_FILE" 2>/dev/null || true
+    fi
+
+    case "${SLEEP_FREEZE_DELAY_SEC:-}" in
+        ''|*[!0-9]*) SLEEP_FREEZE_DELAY_SEC=15 ;;
+    esac
+}
+
+build_freeze_exempt_uids() {
+    EXEMPT_UIDS=" "
+    base_pkgs="com.android.systemui com.anbernic.control com.anbernic.home com.anbernic.keymap com.google.android.inputmethod.latin com.android.inputmethod.latin com.topjohnwu.magisk"
+    target_pkgs=""
+
+    for item in $base_pkgs $FREEZE_WHITELIST; do
+        case "$item" in
+            '' ) continue ;;
+            *[!0-9]* ) target_pkgs="$target_pkgs $item" ;;
+            * ) EXEMPT_UIDS="${EXEMPT_UIDS}${item} " ;;
+        esac
+    done
+
+    if [ -r "/data/system/packages.list" ] && [ -n "$target_pkgs" ]; then
+        while read -r pkg uid _rest; do
+            case "$uid" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            for wp in $target_pkgs; do
+                if [ "$pkg" = "$wp" ]; then
+                    case "$EXEMPT_UIDS" in
+                        *" $uid "*) ;;
+                        *) EXEMPT_UIDS="${EXEMPT_UIDS}${uid} " ;;
+                    esac
+                    break
+                fi
+            done
+        done < /data/system/packages.list
+    fi
+
+    for wl in $(dumpsys deviceidle whitelist 2>/dev/null); do
+        case "$wl" in
+            user,*)
+                wuid=${wl##*,}
+                case "$wuid" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        case "$EXEMPT_UIDS" in
+                            *" $wuid "*) ;;
+                            *) EXEMPT_UIDS="${EXEMPT_UIDS}${wuid} " ;;
+                        esac
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+get_active_vpn_uids() {
+    has_tun=0
+    for nif in /sys/class/net/tun* /sys/class/net/wg* /sys/class/net/ppp*; do
+        if [ -e "$nif" ]; then
+            has_tun=1
+            break
+        fi
+    done
+    [ "$has_tun" -eq 0 ] && return
+
+    vpns=$(dumpsys connectivity 2>/dev/null | awk '/VpnTransportInfo|IS_VPN/ { for(i=1;i<=NF;i++) if($i=="OwnerUid:" && $(i+1) ~ /^[0-9]+$/) print $(i+1) }')
+    for wl in $(dumpsys deviceidle whitelist 2>/dev/null); do
+        case "$wl" in
+            user,*)
+                wuid=${wl##*,}
+                case "$wuid" in
+                    ''|*[!0-9]*) ;;
+                    *) vpns="$vpns $wuid" ;;
+                esac
+                ;;
+        esac
+    done
+    echo "$vpns"
+}
+
+freeze_sleep_apps() {
+    frozen_uids=""
+    cur_exempt="${EXEMPT_UIDS} $(get_active_vpn_uids) "
+    for d in /sys/fs/cgroup/uid_*; do
+        [ -w "$d/cgroup.freeze" ] || continue
+        uid=${d##*/uid_}
+        case "$uid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$uid" -lt 10000 ] && continue
+        case "$cur_exempt" in
+            *" $uid "*) continue ;;
+        esac
+        read -r cur_frz < "$d/cgroup.freeze" 2>/dev/null || cur_frz=""
+        if [ "$cur_frz" != "1" ]; then
+            if echo 1 > "$d/cgroup.freeze" 2>/dev/null; then
+                frozen_uids="$frozen_uids $uid"
+            fi
+        fi
+    done
+}
+
+unfreeze_sleep_apps() {
+    if [ -n "$frozen_uids" ]; then
+        for uid in $frozen_uids; do
+            fnode="/sys/fs/cgroup/uid_${uid}/cgroup.freeze"
+            [ -w "$fnode" ] && echo 0 > "$fnode" 2>/dev/null || true
+        done
+        frozen_uids=""
+    fi
+}
+
+unfreeze_all_user_cgroups() {
+    for d in /sys/fs/cgroup/uid_*; do
+        [ -w "$d/cgroup.freeze" ] || continue
+        uid=${d##*/uid_}
+        case "$uid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$uid" -lt 10000 ] && continue
+        read -r cur_frz < "$d/cgroup.freeze" 2>/dev/null || cur_frz=""
+        [ "$cur_frz" = "1" ] && echo 0 > "$d/cgroup.freeze" 2>/dev/null || true
+    done
+    frozen_uids=""
+}
+
+apply_boot_tweaks() {
+    if [ "${ENABLE_VM_UFS_TUNE:-1}" -eq 1 ]; then
+        w "/dev/cpuctl/background/cpu.uclamp.max" "30"
+        w "/dev/cpuctl/system-background/cpu.uclamp.max" "50"
+        w "/sys/kernel/mm/lru_gen/min_ttl_ms" "1000"
+        w "/proc/sys/vm/swappiness" "60"
+        w "/sys/block/sdc/queue/read_ahead_kb" "256"
+        w "/sys/block/sdc/queue/iostats" "0"
+    fi
+
+    if [ "${ENABLE_POWER_SETTINGS:-1}" -eq 1 ]; then
+        settings put global mobile_data_always_on 0 >/dev/null 2>&1 || true
+        settings put secure doze_pulse_on_pick_up 0 >/dev/null 2>&1 || true
+        settings put secure wake_gesture_enabled 0 >/dev/null 2>&1 || true
+    fi
+
+    if [ "${STOP_MTK_LOGGERS:-1}" -eq 1 ]; then
+        for svc in mobile_log_d emdlogger traced traced_probes; do
+            stop "$svc" 2>/dev/null || true
+        done
+    fi
+
+    if [ "${STOP_GPS_DAEMONS:-0}" -eq 1 ]; then
+        for svc in agpsd vendor.gnss-default mtk_lbs_service; do
+            stop "$svc" 2>/dev/null || true
+        done
+    fi
+
+    if [ "${STOP_RIL_DAEMON:-0}" -eq 1 ]; then
+        stop vendor.ril-daemon-mtk 2>/dev/null || true
+    fi
+
+    if [ "${ENABLE_DOZE_TUNE:-1}" -eq 1 ]; then
+        dumpsys deviceidle enable all >/dev/null 2>&1 || true
+        settings put global device_idle_constants "light_after_inactive_to=60000,light_pre_idle_to=60000,light_idle_to=180000,inactive_to=180000,sensing_to=0,locating_to=0,location_accuracy=20.0,motion_inactive_to=0,idle_after_inactive_to=180000" >/dev/null 2>&1 || true
+    fi
 }
 
 get_max_soc_temp() {
@@ -64,6 +283,9 @@ apply_profile() {
             w "${GED_HAL}/custom_boost_gpu_freq" 64
             w "${GED_HAL}/dvfs_margin_value" 530
             w "${GED_HAL}/loading_base_dvfs_step" 4
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 2600000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 2800000
+            w "$UFS_GOV" "simple_ondemand"
             apply_cpu_schedutil 2000 400000
             w "$UCLAMP_TOP" 0
             w "$UCLAMP_LAT" 0
@@ -74,6 +296,9 @@ apply_profile() {
             w "${GED_HAL}/dvfs_margin_value" 530
             w "${GED_HAL}/loading_base_dvfs_step" 4
             apply_cpu_schedutil 4000 400000
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 700000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 700000
+            w "$UFS_GOV" "powersave"
             w "$UCLAMP_TOP" 0
             w "$UCLAMP_LAT" 0
             ;;
@@ -86,6 +311,9 @@ apply_profile() {
             w "${GED_HAL}/timer_base_dvfs_margin" 50
             w "${GED_HAL}/loading_base_dvfs_step" 15
             w "${GED_HAL}/custom_boost_gpu_freq" 64
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
+            w "$UFS_GOV" "simple_ondemand"
             apply_cpu_schedutil 1000 400000
             w "$UCLAMP_TOP" 45
             w "$UCLAMP_LAT" 1
@@ -100,6 +328,9 @@ apply_profile() {
             w "${GED_HAL}/timer_base_dvfs_margin" 40
             w "${GED_HAL}/loading_base_dvfs_step" 18
             w "${GED_HAL}/custom_boost_gpu_freq" 38
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
+            w "$UFS_GOV" "simple_ondemand"
             apply_cpu_schedutil 1000 1400000
             w "$UCLAMP_TOP" 55
             w "$UCLAMP_LAT" 1
@@ -111,6 +342,9 @@ apply_profile() {
             w "${GED_HAL}/dvfs_margin_value" 530
             w "${GED_HAL}/loading_base_dvfs_step" 4
             apply_cpu_schedutil 4000 400000
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 700000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 700000
+            w "$UFS_GOV" "powersave"
             w "$UCLAMP_TOP" 0
             w "$UCLAMP_LAT" 0
             ;;
@@ -118,6 +352,9 @@ apply_profile() {
             w "$CPUIDLE_GOV" "teo"
             w "${GPU_DEV}/max_freq" 1400000000
             w "/sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq" 400000
+            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
+            w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
+            w "$UFS_GOV" "simple_ondemand"
             w "${GED_HAL}/custom_boost_gpu_freq" 64
             w "${GED_HAL}/dvfs_margin_value" 130
             w "$UCLAMP_TOP" 60
@@ -185,6 +422,11 @@ cached_fan_mode="1"
 
 cleanup() {
     trap - INT TERM EXIT
+    unfreeze_sleep_apps
+    unfreeze_all_user_cgroups
+    w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
+    w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
+    w "$UFS_GOV" "simple_ondemand"
     [ -e "$AMP_NODE" ] && echo "0.1" > "$AMP_NODE" 2>/dev/null || true
     if [ "${fan_owned:-0}" -eq 1 ] && [ -e "$FAN_NODE" ]; then
         chmod 666 "$FAN_NODE" 2>/dev/null || true
@@ -192,6 +434,10 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM EXIT
+
+load_config
+build_freeze_exempt_uids
+apply_boot_tweaks
 
 while true; do
     bright=1
@@ -203,10 +449,19 @@ while true; do
         esac
     fi
 
+    if [ "$bright" -gt 0 ]; then
+        if [ "$apps_frozen" -eq 1 ]; then
+            unfreeze_sleep_apps
+            apps_frozen=0
+        fi
+        sleep_sec=0
+    fi
+
     # Click-free analog speaker amp control (no AudioFlinger standby timers):
     # - Screen ON & 3.5mm jack unplugged -> 1.0 (hold GPIO 5 amp ON; stock 3s DSP/DAC standby stays active)
     # - 3.5mm jack plugged -> 0.1 (route to headset & power off speaker amp immediately)
     # - Screen OFF & unplugged -> 0.1 unless background speaker playback is currently active (AFE runtime_status=active)
+    want_amp="0.1"
     if [ -e "$AMP_NODE" ]; then
         jack_state=0
         if [ -r "$JACK_NODE" ]; then
@@ -257,6 +512,13 @@ while true; do
         if [ "$last_state" != "screen_off" ]; then
             run_heavy=1
         fi
+        if [ "${ENABLE_SLEEP_FREEZE:-1}" -eq 1 ] && [ "$apps_frozen" -eq 0 ] && [ "$want_amp" != "1.0" ]; then
+            sleep_sec=$((sleep_sec + loop_sleep))
+            if [ "$sleep_sec" -ge "$SLEEP_FREEZE_DELAY_SEC" ]; then
+                freeze_sleep_apps
+                apps_frozen=1
+            fi
+        fi
     else
         loop_sleep=1
         if [ $((tick % 2)) -eq 0 ] || [ "$last_state" = "screen_off" ] || [ -z "$last_state" ]; then
@@ -305,6 +567,13 @@ while true; do
             if [ -r "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor" ]; then
                 cur_gov=$(cat "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor" 2>/dev/null)
                 [ "$cur_gov" != "schedutil" ] && need_reapply=1
+            fi
+            if [ -r "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" ]; then
+                cur_p4max=$(cat "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 2>/dev/null)
+                case "$cur_p4max" in
+                    ''|*[!0-9]*) ;;
+                    *) [ "$cur_p4max" -le 700000 ] && need_reapply=1 ;;
+                esac
             fi
             [ "$need_reapply" -eq 1 ] && apply_profile "$target"
         fi
