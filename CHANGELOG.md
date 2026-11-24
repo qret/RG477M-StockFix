@@ -1,5 +1,15 @@
 # Changelog (`RG477M-StockFix`)
 
+## v0.1.5
+- **Strict Manual Fan Lock (`fan_mode=3`/`4`):**
+  - When manual/custom fan mode is selected, the daemon now takes `chmod 644` ownership of `pwm_fan_set` and holds the exact user-chosen speed (`custom_fan_speed`, `PWM = round(pct * 255 / 100)`) while screen is on (`0 PWM` in sleep), eliminating Anbernic Control's stock `>= 65 °C -> 100% (PWM 255)` jump.
+- **Instant Wake-Up & No Post-Sleep Freeze (`rg477m_perf_daemon.sh`):**
+  - **Restored wake-up order (`fast_wake_boost`):** on screen-on from `screen_off`, `policy4/7` `700 MHz` caps (`3200/3350 MHz`, or `2600/2800 MHz` when `in_thermal=1`), `UFS` (`simple_ondemand`), `schedutil/rate_limit_us=1000`, and `top-app uclamp` are restored first in ~1–2 ms before `unfreeze_sleep_apps`, `thermal_zone*` polling, and `getprop`.
+  - **Reduced sleep poll interval to `1s`:** changed `loop_sleep` in `screen_off` from `3s` to `1s` (ordinary `CLOCK_MONOTONIC` `sleep` does not wake the SoC from `Suspend-to-RAM`, while cutting max wake detection delay 3x).
+  - **Dynamic `CATEGORY_HOME` exemption:** resolved active home launcher (`cmd package resolve-activity ... CATEGORY_HOME`) and added its UID to `EXEMPT_UIDS`, preventing third-party frontends/launchers (ES-DE, Daijisho, Beacon, Launcher3, etc.) from freezing during sleep.
+  - **Forkless sysfs & wake IPC:** pre-cached matching `thermal_zone*` nodes at startup (`init_thermal_zones`), replaced `$(cat ...)` subshell forks in `get_max_soc_temp()` and `need_reapply` with shell `read -r`, and skipped heavy `settings get system fan_mode` IPC on the wake-up tick.
+  - **Fixed `mode_3` (Turbo) recovery:** restored `apply_cpu_schedutil 1000 400000`, `FIX_OPP=-1`, `timer_base_dvfs_margin=40`, and `loading_base_dvfs_step=18` when returning to `mode_3` after sleep/saver.
+
 ## v0.1.4
 - **Tier 1 & Tier 2 Power Optimization + Config (`/data/adb/rg477m_stockfix.conf`):**
   - Added user-configurable toggle file `/data/adb/rg477m_stockfix.conf` (auto-created on first boot with all options enabled by default, plus `FREEZE_WHITELIST` for custom package/UID exclusions).

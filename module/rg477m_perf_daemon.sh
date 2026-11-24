@@ -17,6 +17,7 @@ UCLAMP_LAT="/dev/cpuctl/top-app/cpu.uclamp.latency_sensitive"
 CPUIDLE_GOV="/sys/devices/system/cpu/cpuidle/current_governor"
 BL_FILE="/sys/class/leds/lcd-backlight/brightness"
 FAN_NODE="/sys/devices/platform/pwm_fan/pwm_fan_set"
+ANBERNIC_SETTINGS_XML="/data/data/com.anbernic.control/shared_prefs/cs_settings.xml"
 AMP_NODE="/sys/devices/platform/11050000.mt6897-afe-pcm/is_fm_enable"
 AFE_PM_NODE="/sys/devices/platform/11050000.mt6897-afe-pcm/power/runtime_status"
 JACK_NODE="/sys/bus/platform/drivers/pmic-codec-accdet/state"
@@ -32,6 +33,7 @@ STOP_RIL_DAEMON=0
 FREEZE_WHITELIST=""
 
 EXEMPT_UIDS=""
+THERMAL_TEMP_NODES=""
 frozen_uids=""
 apps_frozen=0
 sleep_sec=0
@@ -95,6 +97,13 @@ build_freeze_exempt_uids() {
             * ) EXEMPT_UIDS="${EXEMPT_UIDS}${item} " ;;
         esac
     done
+
+    home_cmp=$(cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN 2>/dev/null | tail -n 1)
+    home_pkg=${home_cmp%%/*}
+    case "$home_pkg" in
+        ''|*[!A-Za-z0-9._-]*) ;;
+        *) target_pkgs="$target_pkgs $home_pkg" ;;
+    esac
 
     if [ -r "/data/system/packages.list" ] && [ -n "$target_pkgs" ]; then
         while read -r pkg uid _rest; do
@@ -240,16 +249,26 @@ apply_boot_tweaks() {
     fi
 }
 
-get_max_soc_temp() {
-    max_t=0
+init_thermal_zones() {
+    THERMAL_TEMP_NODES=""
     for tz in /sys/class/thermal/thermal_zone*; do
         [ -r "$tz/type" ] && [ -r "$tz/temp" ] || continue
-        t=$(cat "$tz/type" 2>/dev/null)
+        t=""
+        read -r t < "$tz/type" 2>/dev/null || continue
         case "$t" in
-            soc_max|soc-*|cpu-*|gpu1|gpu2) ;;
-            *) continue ;;
+            soc_max|soc-*|cpu-*|gpu1|gpu2)
+                THERMAL_TEMP_NODES="${THERMAL_TEMP_NODES} ${tz}/temp"
+                ;;
         esac
-        val=$(cat "$tz/temp" 2>/dev/null)
+    done
+}
+
+get_max_soc_temp() {
+    max_t=0
+    [ -z "$THERMAL_TEMP_NODES" ] && init_thermal_zones
+    for tnode in $THERMAL_TEMP_NODES; do
+        val=""
+        read -r val < "$tnode" 2>/dev/null || continue
         case "$val" in
             ''|*[!0-9]*) continue ;;
         esac
@@ -350,17 +369,56 @@ apply_profile() {
             ;;
         mode_3)
             w "$CPUIDLE_GOV" "teo"
+            w "$FIX_OPP" -1
             w "${GPU_DEV}/max_freq" 1400000000
-            w "/sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq" 400000
+            w "${GED_HAL}/dvfs_margin_value" 130
+            w "${GED_HAL}/timer_base_dvfs_margin" 40
+            w "${GED_HAL}/loading_base_dvfs_step" 18
+            w "${GED_HAL}/custom_boost_gpu_freq" 64
             w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
             w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
             w "$UFS_GOV" "simple_ondemand"
-            w "${GED_HAL}/custom_boost_gpu_freq" 64
-            w "${GED_HAL}/dvfs_margin_value" 130
+            apply_cpu_schedutil 1000 400000
             w "$UCLAMP_TOP" 60
             w "$UCLAMP_LAT" 1
             ;;
     esac
+}
+
+fast_wake_boost() {
+    if [ "$in_thermal" -eq 1 ]; then
+        w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 2600000
+        w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 2800000
+    else
+        w "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 3200000
+        w "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq" 3350000
+    fi
+    w "$UFS_GOV" "simple_ondemand"
+    apply_cpu_schedutil 1000 400000
+    w "$UCLAMP_TOP" 45
+    w "$UCLAMP_LAT" 1
+}
+
+read_custom_fan_xml() {
+    [ -r "$ANBERNIC_SETTINGS_XML" ] || return 1
+    xml_line=""
+    while read -r xml_line; do
+        case "$xml_line" in
+            *'custom_fan_speed&quot;:'*)
+                v=${xml_line#*custom_fan_speed&quot;:}
+                v=${v%%[!0-9]*}
+                case "$v" in
+                    ''|*[!0-9]*) return 1 ;;
+                    *)
+                        [ "$v" -gt 100 ] && v=100
+                        cached_custom_fan="$v"
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+    done < "$ANBERNIC_SETTINGS_XML"
+    return 1
 }
 
 calc_target_fan_pwm() {
@@ -419,6 +477,7 @@ fan_owned=0
 tick=0
 heavy_tick=0
 cached_fan_mode="1"
+cached_custom_fan="50"
 
 cleanup() {
     trap - INT TERM EXIT
@@ -437,6 +496,7 @@ trap cleanup INT TERM EXIT
 
 load_config
 build_freeze_exempt_uids
+init_thermal_zones
 apply_boot_tweaks
 
 while true; do
@@ -449,7 +509,12 @@ while true; do
         esac
     fi
 
+    woke_this_tick=0
     if [ "$bright" -gt 0 ]; then
+        if [ "$last_state" = "screen_off" ]; then
+            fast_wake_boost
+            woke_this_tick=1
+        fi
         if [ "$apps_frozen" -eq 1 ]; then
             unfreeze_sleep_apps
             apps_frozen=0
@@ -507,7 +572,8 @@ while true; do
                 fan_owned=0
             fi
         fi
-        loop_sleep=3
+        # 1s CLOCK_MONOTONIC sleep does not wake SoC from Suspend-to-RAM and cuts wake lag 3x
+        loop_sleep=1
         # Run heavy loop only ONCE on screen-off transition to apply idle profile & power down
         if [ "$last_state" != "screen_off" ]; then
             run_heavy=1
@@ -561,15 +627,18 @@ while true; do
         elif [ "$target" = "mode_1" ] || [ "$target" = "mode_2" ]; then
             need_reapply=0
             if [ -r "${GPU_DEV}/max_freq" ]; then
-                cur_max=$(cat "${GPU_DEV}/max_freq" 2>/dev/null)
+                cur_max=""
+                read -r cur_max < "${GPU_DEV}/max_freq" 2>/dev/null || cur_max=""
                 [ "$cur_max" != "1400000000" ] && need_reapply=1
             fi
             if [ -r "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor" ]; then
-                cur_gov=$(cat "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor" 2>/dev/null)
+                cur_gov=""
+                read -r cur_gov < "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor" 2>/dev/null || cur_gov=""
                 [ "$cur_gov" != "schedutil" ] && need_reapply=1
             fi
             if [ -r "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" ]; then
-                cur_p4max=$(cat "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 2>/dev/null)
+                cur_p4max=""
+                read -r cur_p4max < "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq" 2>/dev/null || cur_p4max=""
                 case "$cur_p4max" in
                     ''|*[!0-9]*) ;;
                     *) [ "$cur_p4max" -le 700000 ] && need_reapply=1 ;;
@@ -578,13 +647,23 @@ while true; do
             [ "$need_reapply" -eq 1 ] && apply_profile "$target"
         fi
 
-        # Smooth Auto Fan Controller (takes over only when screen is ON and stock fan_mode == 1 or 2)
+        # Adaptive Fan Controller (takes over when screen is ON for fan_mode 1/2 EMA curves and 3/4 strict manual PWM)
         # Check settings every 3 heavy ticks (~6s) while screen is ON to keep CPU overhead near zero
-        if [ "$bright" -gt 0 ] && [ $((heavy_tick % 3)) -eq 0 ]; then
+        if [ "$bright" -gt 0 ] && [ "$woke_this_tick" -eq 0 ] && [ $((heavy_tick % 3)) -eq 0 ]; then
             fm=$(settings get system fan_mode 2>/dev/null)
             case "$fm" in
                 0|1|2|3|4) cached_fan_mode="$fm" ;;
             esac
+            if [ "$cached_fan_mode" = "3" ] || [ "$cached_fan_mode" = "4" ]; then
+                cf=$(settings get system custom_fan_speed 2>/dev/null)
+                case "$cf" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        [ "$cf" -gt 100 ] && cf=100
+                        cached_custom_fan="$cf"
+                        ;;
+                esac
+            fi
         fi
 
         if [ "$bright" -gt 0 ] && [ -e "$FAN_NODE" ]; then
@@ -613,9 +692,23 @@ while true; do
                     [ "$cur_pwm" -lt 0 ] && cur_pwm=0
                     echo "$cur_pwm" > "$FAN_NODE" 2>/dev/null || true
                 fi
+            elif [ "$cached_fan_mode" = "3" ] || [ "$cached_fan_mode" = "4" ]; then
+                read_custom_fan_xml || true
+                if [ "$fan_owned" -eq 0 ]; then
+                    # Lock out Anbernic Control so its stock 65C -> 255 PWM override cannot cause fan spikes
+                    chmod 644 "$FAN_NODE" 2>/dev/null || true
+                    fan_owned=1
+                fi
+                tgt_pwm=$(( (cached_custom_fan * 255 + 50) / 100 ))
+                [ "$tgt_pwm" -lt 0 ] && tgt_pwm=0
+                [ "$tgt_pwm" -gt 255 ] && tgt_pwm=255
+                if [ "$cur_pwm" -ne "$tgt_pwm" ]; then
+                    cur_pwm=$tgt_pwm
+                    echo "$cur_pwm" > "$FAN_NODE" 2>/dev/null || true
+                fi
             else
                 if [ "$fan_owned" -eq 1 ]; then
-                    # Return full control to Anbernic Control for manual/off/max/custom modes
+                    # Return full control to Anbernic Control for fan_mode=0 (off/silent)
                     chmod 666 "$FAN_NODE" 2>/dev/null || true
                     fan_owned=0
                 fi
